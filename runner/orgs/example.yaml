@@ -1,0 +1,22 @@
+# Example org file — copy and rename this to <your-org>.yaml
+#
+# org:     (required) GitHub org name
+# repos:   (optional) curated list of repos to assess. If omitted, all
+#           public repos in the org are discovered automatically.
+# exclude: (optional) repos to skip regardless of discovery mode.
+#
+# Usage:
+#   python runner/assess.py --from-file runner/orgs/<your-org>.yaml
+#   python runner/assess.py --from-file runner/orgs/*.yaml  # all orgs
+
+org: your-org-name
+
+# repos:
+#   - repo-a
+#   - repo-b
+
+# exclude:
+#   - .github       # always exclude hidden dirs — these are not real repos
+#   - .fullsend
+#   - archived-repo
+#   - fork-we-dont-care-about
