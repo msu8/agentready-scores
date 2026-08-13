@@ -1,8 +1,10 @@
+import dataclasses
 import glob
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -15,6 +17,17 @@ import yaml
 
 class SchemaError(ValueError):
     """Raised when a repos YAML file fails schema validation."""
+
+
+@dataclasses.dataclass
+class AssessmentResult:
+    repo: str
+    status: str
+    category: str
+    message: str
+    output_path: str
+    is_new: bool = False
+    score: Optional[float] = None
 
 
 def _validate_repos_yaml(data: dict, path: Path) -> None:
@@ -151,6 +164,27 @@ def discover_org_repos(org: str) -> List[str]:
 discover_prod_repos = discover_org_repos
 
 
+def check_repo_access(org: str, repo: str) -> str:
+    """Return 'accessible', 'forbidden', or 'not_found'."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests.head(
+            f"https://api.github.com/repos/{org}/{repo}",
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return "accessible"
+        if resp.status_code == 403:
+            return "forbidden"
+        return "not_found"
+    except requests.RequestException:
+        return "not_found"
+
+
 def _prior_commit_hash(latest_json: Path) -> Optional[str]:
     """
     Return repository.commit_hash from an existing assessment-latest.json,
@@ -163,11 +197,28 @@ def _prior_commit_hash(latest_json: Path) -> Optional[str]:
         return None
 
 
-def assess_repo(org: str, repo: str, output_dir: Path) -> str:
+def _read_overall_score(json_path: Path) -> Optional[float]:
+    """Return overall_score from an assessment JSON file, or None if unreadable."""
+    try:
+        with open(json_path) as f:
+            return json.load(f).get("overall_score")
+    except Exception:
+        return None
+
+
+def assess_repo(org: str, repo: str, output_dir: Path) -> AssessmentResult:
     """
     Clone repo, run agentready container, extract JSON, write to submissions dir.
-    Returns the path of the assessment JSON written, or raises on failure.
+    Always returns an AssessmentResult — never raises.
     """
+    access = check_repo_access(org, repo)
+    if access == "forbidden":
+        return AssessmentResult(repo=repo, status="skipped", category="auth_forbidden",
+                                message="HTTP 403 — token lacks access", output_path="")
+    if access == "not_found":
+        return AssessmentResult(repo=repo, status="skipped", category="auth_not_found",
+                                message="HTTP 404 — repo not found or network error", output_path="")
+
     repo_submissions_dir = output_dir / org / repo
     repo_submissions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,77 +227,116 @@ def assess_repo(org: str, repo: str, output_dir: Path) -> str:
         output_tmp = Path(tmp) / "output"
         output_tmp.mkdir()
 
-        # Shallow clone
-        subprocess.run(
-            [
-                "git", "clone", "--depth=1",
-                f"https://github.com/{org}/{repo}.git",
-                str(clone_dir),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
+        # Shallow clone — use a credential helper to authenticate without
+        # exposing the token in the URL or process arguments
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        clone_url = f"https://github.com/{org}/{repo}.git"
+        clone_extra = []
+        clone_env = None
+        if token:
+            helper = Path(tmp) / "credential-helper.sh"
+            helper.write_text(
+                "#!/bin/sh\n"
+                "echo username=x-access-token\n"
+                'echo "password=$GIT_CLONE_TOKEN"\n'
+            )
+            helper.chmod(0o755)
+            clone_env = {**os.environ, "GIT_CLONE_TOKEN": token}
+            clone_extra = ["-c", "credential.helper=", "-c", f"credential.helper=!'{helper}'"]
+        try:
+            subprocess.run(
+                ["git"] + clone_extra + ["clone", "--depth=1", clone_url, str(clone_dir)],
+                check=True,
+                capture_output=True,
+                timeout=120,
+                env=clone_env,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode(errors="replace")[:500]
+            return AssessmentResult(repo=repo, status="failed", category="clone_failure",
+                                    message=stderr, output_path="")
+        except subprocess.TimeoutExpired:
+            return AssessmentResult(repo=repo, status="failed", category="clone_failure",
+                                    message="git clone timed out after 120s", output_path="")
 
-        # Commit hash pre-check — skip if HEAD matches the last assessed commit
-        head_hash = subprocess.check_output(
+        # Commit hash pre-check
+        head_result = subprocess.run(
             ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
+            capture_output=True,
             timeout=10,
-        ).decode().strip()
+        )
+        if head_result.returncode != 0:
+            return AssessmentResult(repo=repo, status="skipped", category="empty",
+                                    message="repo has no commits", output_path="")
+        head_hash = head_result.stdout.decode().strip()
         existing_latest = repo_submissions_dir / "assessment-latest.json"
+        # Computed via existence, not via prior_hash being None — a corrupted or
+        # unparseable existing file must not be misreported as "new".
+        is_new = not existing_latest.exists()
         prior_hash = _prior_commit_hash(existing_latest)
         if prior_hash and head_hash == prior_hash:
-            return "skipped:unchanged"
+            return AssessmentResult(repo=repo, status="skipped", category="unchanged",
+                                    message=f"HEAD {head_hash[:8]} matches prior assessment",
+                                    output_path="")
 
         uid = subprocess.check_output(["id", "-u"]).decode().strip()
         gid = subprocess.check_output(["id", "-g"]).decode().strip()
 
-        # Run agentready container
-        subprocess.run(
-            [
-                "podman", "run", "--rm",
-                "--user", f"{uid}:{gid}",
-                "--userns=keep-id",
-                "-e", "GIT_CONFIG_COUNT=1",
-                "-e", "GIT_CONFIG_KEY_0=safe.directory",
-                "-e", "GIT_CONFIG_VALUE_0=/repo",
-                "-v", f"{clone_dir}:/repo:ro,z",
-                "-v", f"{output_tmp}:/reports:z",
-                "ghcr.io/ambient-code/agentready:latest",
-                "assess", "/repo", "--output-dir", "/reports",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=600,
-        )
+        # Run agentready container — pipe "y" to auto-confirm large-repo prompt
+        try:
+            subprocess.run(
+                [
+                    "podman", "run", "-i", "--rm",
+                    "--user", f"{uid}:{gid}",
+                    "--userns=keep-id",
+                    "-e", "GIT_CONFIG_COUNT=1",
+                    "-e", "GIT_CONFIG_KEY_0=safe.directory",
+                    "-e", "GIT_CONFIG_VALUE_0=/repo",
+                    "-v", f"{clone_dir}:/repo:ro,z",
+                    "-v", f"{output_tmp}:/reports:z",
+                    "ghcr.io/ambient-code/agentready:latest",
+                    "assess", "/repo", "--output-dir", "/reports",
+                ],
+                input="y\n",
+                text=True,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "")[:500]
+            return AssessmentResult(repo=repo, status="failed", category="container_failure",
+                                    message=stderr, output_path="")
+        except subprocess.TimeoutExpired:
+            return AssessmentResult(repo=repo, status="failed", category="container_failure",
+                                    message="podman run timed out after 600s", output_path="")
 
-        # Find timestamped assessment JSONs only (exclude symlinks like assessment-latest.json)
+        # Find timestamped assessment JSONs only (exclude symlinks)
         all_json = glob.glob(str(output_tmp / "assessment-*.json"))
         json_files = [f for f in all_json if not os.path.islink(f)]
         if not json_files:
-            # Fall back to resolving symlinks if no plain files found
             json_files = [str(Path(f).resolve()) for f in all_json if os.path.islink(f)]
         if not json_files:
-            raise FileNotFoundError(
-                f"No assessment JSON found in agentready output for {repo}"
-            )
+            return AssessmentResult(repo=repo, status="failed", category="output_missing",
+                                    message="no assessment JSON found in container output",
+                                    output_path="")
 
-        # Take the most recent timestamped file
         json_files.sort()
-        src_json = Path(json_files[-1])
-        # Always use the real filename (resolve symlinks)
-        src_json = src_json.resolve()
+        src_json = Path(json_files[-1]).resolve()
 
         dest_json = repo_submissions_dir / src_json.name
         shutil.copy2(src_json, dest_json)
+        score = _read_overall_score(dest_json)
 
-        # Create/update the assessment-latest.json symlink pointing to the timestamped file
         symlink = repo_submissions_dir / "assessment-latest.json"
         if symlink.exists() or symlink.is_symlink():
             symlink.unlink()
         symlink.symlink_to(src_json.name)
 
-        return str(dest_json)
+        return AssessmentResult(repo=repo, status="succeeded", category="",
+                                message="", output_path=str(dest_json),
+                                is_new=is_new, score=score)
 
 
 def run_batch(
@@ -255,13 +345,15 @@ def run_batch(
     output_dir: Path,
     workers: int,
     retries: int,
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str], List[AssessmentResult]]:
     """
-    Run assessments concurrently. Returns (succeeded_repos, failed_repos).
-    Retries failed repos up to `retries` times.
+    Run assessments concurrently.
+    Returns (succeeded, failed, inaccessible, all_results).
     """
     succeeded = []
+    inaccessible = []
     failed = list(repos)
+    all_results: List[AssessmentResult] = []
 
     for attempt in range(retries + 1):
         if not failed:
@@ -281,16 +373,34 @@ def run_batch(
                 repo = futures[future]
                 try:
                     result = future.result()
-                    if result == "skipped:unchanged":
-                        print(f"  ⏭  {org}/{repo} — unchanged, skipped")
-                    else:
-                        print(f"  ✓ {org}/{repo} → {result}")
+                    all_results.append(result)
+                    if result.status == "succeeded":
+                        print(f"  ✓ {org}/{repo} → {result.output_path}")
                         succeeded.append(repo)
+                    elif result.status == "skipped":
+                        if result.category in ("auth_forbidden", "auth_not_found"):
+                            print(f"  🔒 {org}/{repo} — {result.message}")
+                            inaccessible.append(repo)
+                        else:
+                            print(f"  ⏭  {org}/{repo} — {result.category}: {result.message}")
+                    else:
+                        print(f"  ✗ {org}/{repo} — {result.category}: {result.message}")
+                        failed.append(repo)
                 except Exception as e:
                     print(f"  ✗ {org}/{repo}: {e}")
+                    all_results.append(AssessmentResult(
+                        repo=repo, status="failed", category="clone_failure",
+                        message=str(e)[:500], output_path="",
+                    ))
                     failed.append(repo)
 
-    return succeeded, failed
+    # Deduplicate all_results by keeping only the last result per repo
+    seen = {}
+    for r in all_results:
+        seen[r.repo] = r
+    all_results = list(seen.values())
+
+    return succeeded, failed, inaccessible, all_results
 
 
 def commit_results(repo_root: Path, org: str, repos: List[str]) -> None:
@@ -325,3 +435,129 @@ def write_failed_repos(path: Path, org: str, repos: List[str]) -> None:
     with open(path, "w") as f:
         f.write(f"# Failed repos from {datetime.now(timezone.utc).isoformat()}\n")
         yaml.dump(data, f, default_flow_style=False)
+
+
+def write_new_repos(path: Path, org: str, repos: List[Tuple[str, Optional[float]]]) -> None:
+    """Write newly-scored repos (name + score) to a YAML file."""
+    data = {"org": org, "repos": [{"name": name, "score": score} for name, score in repos]}
+    with open(path, "w") as f:
+        f.write(f"# New repos scored from {datetime.now(timezone.utc).isoformat()}\n")
+        yaml.dump(data, f, default_flow_style=False)
+
+
+def validate_token() -> bool:
+    """Check if GH_TOKEN is set and valid by calling the /user endpoint."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("ERROR: GH_TOKEN is not set.", file=sys.stderr)
+        return False
+    try:
+        resp = requests.get(
+            "https://api.github.com/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"ERROR: GH_TOKEN is invalid or expired (HTTP {resp.status_code}).", file=sys.stderr)
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"ERROR: Failed to validate GH_TOKEN: {e}", file=sys.stderr)
+        return False
+
+
+def collect_summary(runner_dir: Path) -> dict:
+    """Read failed/inaccessible/new-repo YAML files and return a structured summary."""
+    failed_files = sorted(runner_dir.glob("failed-*.yaml"))
+    inaccessible_files = sorted(runner_dir.glob("inaccessible-*.yaml"))
+
+    failed_repos_list = []
+    for f in failed_files:
+        with open(f) as fh:
+            data = yaml.safe_load(fh)
+        org = data.get("org", "?")
+        for repo in data.get("repos") or []:
+            failed_repos_list.append(f"{org}/{repo}")
+
+    inaccessible_count = 0
+    for f in inaccessible_files:
+        with open(f) as fh:
+            data = yaml.safe_load(fh)
+        inaccessible_count += len(data.get("repos") or [])
+
+    failed_count = len(failed_repos_list)
+    truncated = failed_repos_list[:20]
+    repos_str = ", ".join(truncated)
+    if failed_count > 20:
+        repos_str += f" ... and {failed_count - 20} more"
+
+    new_entries = load_new_repos(runner_dir)
+    new_repos_list = [
+        f"{e['org']}/{e['name']} ({e['score'] if e['score'] is not None else 'N/A'})"
+        for e in new_entries
+    ]
+    new_repos_count = len(new_repos_list)
+    new_truncated = new_repos_list[:20]
+    new_repos_str = ", ".join(new_truncated)
+    if new_repos_count > 20:
+        new_repos_str += f" ... and {new_repos_count - 20} more"
+
+    return {
+        "has_failures": failed_count > 0,
+        "failed_count": failed_count,
+        "failed_repos": repos_str,
+        "inaccessible_count": inaccessible_count,
+        "failed_files": failed_files,
+        "inaccessible_files": inaccessible_files,
+        "has_new_repos": new_repos_count > 0,
+        "new_repos_count": new_repos_count,
+        "new_repos": new_repos_str,
+    }
+
+
+def write_error_details(path: Path, org: str, results: list) -> None:
+    """Write error details JSON for non-succeeded assessment results."""
+    errors = [
+        {
+            "repo": r.repo,
+            "status": r.status,
+            "category": r.category,
+            "message": r.message,
+        }
+        for r in results
+        if r.status != "succeeded"
+    ]
+    data = {
+        "org": org,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "errors": errors,
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_error_details(runner_dir: Path) -> list:
+    """Read all errors-*.json files and return a flat list of error entries."""
+    entries = []
+    for path in sorted(runner_dir.glob("errors-*.json")):
+        with open(path) as f:
+            data = json.load(f)
+        org = data.get("org", "?")
+        for entry in data.get("errors", []):
+            entries.append({"org": org, **entry})
+    return entries
+
+
+def load_new_repos(runner_dir: Path) -> list:
+    """Read all new-*.yaml files and return a flat list of {org, name, score} entries."""
+    entries = []
+    for path in sorted(runner_dir.glob("new-*.yaml")):
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        org = data.get("org", "?")
+        for repo in data.get("repos") or []:
+            entries.append({"org": org, "name": repo.get("name", "?"), "score": repo.get("score")})
+    return entries

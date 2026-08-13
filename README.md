@@ -13,49 +13,84 @@ submissions/
 runner/
   assess.py        ← concurrent assessment runner (local + CI)
   runner_lib.py    ← core library (discovery, assessment, git commit)
+  collect_summary.py ← CI summary + GHA annotations
   requirements.txt
   orgs/
     example.yaml   ← copy and rename for each org you want to assess
     {org}.yaml     ← your org config (org name + optional exclude list)
-  tests/
-    test_runner_lib.py
+  status/
+    failed-{org}.yaml       ← repos that failed assessment
+    inaccessible-{org}.yaml ← repos the token can't reach
+tests/
+  test_runner_lib.py
+  test_collect_summary.py
+  test_e2e.py      ← end-to-end tests (requires podman + GH_TOKEN)
+  conftest.py
 .github/workflows/
   assess-manual.yml    ← manual trigger with configurable inputs
   assess-scheduled.yml ← weekly cron for all orgs in runner/orgs/
 ```
 
+## Prerequisites
+
+- [uv](https://docs.astral.sh/uv/) — Python package manager
+- [just](https://just.systems/) — task runner (`brew install just`)
+- [direnv](https://direnv.net/) — automatic env loading (`brew install direnv`)
+- [podman](https://podman.io/) — container runtime (for assessments and e2e tests)
+
 ## Setup
 
 1. Copy `runner/orgs/example.yaml` → `runner/orgs/{your-org}.yaml` and fill in your org name
-2. Add repository secrets:
+2. Set up local secrets:
+   ```bash
+   cp env.example .env
+   # Edit .env — fill in your GH_TOKEN
+   direnv allow
+   ```
+3. Add repository secrets (for CI):
    - `GHCR_TOKEN` — token to pull the `ghcr.io/ambient-code/agentready` image
    - `GH_TOKEN` — GitHub token with `repo` read + `contents: write` access
-3. *(Optional)* Enable Slack failure notifications:
+4. *(Optional)* Enable Slack failure notifications:
    - Secret: `SLACK_WEBHOOK_URL` — your Slack incoming webhook URL
    - Variable: `SLACK_NOTIFICATIONS` = `true`
-4. Run the **Assess repos (manual)** workflow to generate your first assessments
-5. Point your DevLake AgentReady connection at this repo (`submissions/` path)
+5. Run the **Assess repos (manual)** workflow to generate your first assessments
+6. Point your DevLake AgentReady connection at this repo (`submissions/` path)
 
 ## Running Locally
 
+Run `just --list` to see all available recipes.
+
 ```bash
-cd agentready-scores
-pip install -r runner/requirements.txt
-
-export GH_TOKEN=<your-github-token>
-export GHCR_TOKEN=<your-ghcr-token>
-
 # Assess repos listed in an org YAML file
-python runner/assess.py --from-file runner/orgs/{your-org}.yaml
+just assess runner/orgs/{your-org}.yaml
 
 # Assess multiple orgs at once
-python runner/assess.py --from-file runner/orgs/*.yaml
+just assess runner/orgs/*.yaml
+
+# Assess all configured orgs
+just assess-all
 
 # Discover and assess ALL public repos in an org (no YAML needed)
-python runner/assess.py --org your-org-name
+just assess-org your-org-name
 
 # Re-run repos that failed a previous run
-python runner/assess.py --from-file runner/failed-{your-org}.yaml
+just assess-retry your-org-name
+
+# Validate your GH_TOKEN
+just validate-token
+```
+
+## Development
+
+```bash
+# Run unit tests
+just test
+
+# Run e2e tests (requires podman + GH_TOKEN in .env)
+just test-e2e
+
+# Run all tests (unit + e2e)
+just test-all
 ```
 
 ## Org YAML format
@@ -75,12 +110,19 @@ org: your-org-name
 
 ## Failures
 
-When any repo fails to assess, the runner writes `runner/failed-{org}.yaml` (same format as the org YAML) and commits it to the repo. On a fully clean run the file is removed.
+The runner distinguishes two kinds of problems:
+
+| File | Cause | Retried? | Fails workflow? |
+|------|-------|----------|-----------------|
+| `runner/status/failed-{org}.yaml` | Assessment error (timeout, container crash, missing output) | Yes (`--retries`) | Yes |
+| `runner/status/inaccessible-{org}.yaml` | Token cannot reach the repo (private, 403/404) | No | No |
+
+Both files use the same YAML format as org configs. On a fully clean run the corresponding file is removed.
 
 **Re-run failures locally:**
 
 ```bash
-python runner/assess.py --from-file runner/failed-{your-org}.yaml
+just assess-retry {your-org}
 ```
 
 **Re-run failures via GitHub Actions:**
@@ -88,9 +130,11 @@ python runner/assess.py --from-file runner/failed-{your-org}.yaml
 1. Go to **Actions → Assess repos (manual) → Run workflow**
 2. In the `from_file` field enter the path to the failure file, e.g.:
    ```
-   runner/failed-konflux-ci.yaml
+   runner/status/failed-konflux-ci.yaml
    ```
 3. Click **Run workflow** — only the previously failed repos will be assessed
+
+Inaccessible repos should not be re-run — they require a token with broader access or the repo to be made public.
 
 ## Editing an org YAML
 
@@ -131,3 +175,5 @@ DevLake discovers all `{org}/{repo}` scopes from the submissions tree and ingest
 ## Notifications
 
 Slack failure notifications are sent when `SLACK_NOTIFICATIONS = 'true'` is set as a repository variable and `SLACK_WEBHOOK_URL` is configured as a secret. Notifications fire on both manual and scheduled workflow failures.
+
+The scheduled workflow also sends a batched Slack message whenever any repository gets its first-ever successful score in that run, and emits a `::notice::` GitHub Actions annotation per newly-scored repo on both workflows. New-repo notifications share the same `SLACK_NOTIFICATIONS`/`SLACK_WEBHOOK_URL` configuration as failure notifications — there is no separate toggle, and no manual-workflow Slack message for new repos.

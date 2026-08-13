@@ -8,7 +8,7 @@
 
 **Tech Stack:** GitHub Actions, Python 3.11, podman (pre-installed on `ubuntu-latest` runners via `runs-on: ubuntu-latest`)
 
-All files in: `/home/dbaez/Projects/devlake_tools/agentready-scores/.github/workflows/`
+All files in: `<agentready-scores-checkout>/.github/workflows/`
 
 ---
 
@@ -231,7 +231,7 @@ Note: `GITHUB_TOKEN` is built-in and does not need to be added manually. It is u
 - [ ] **Step 1: Commit both workflows**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/agentready-scores
+cd <agentready-scores-checkout>
 git add .github/workflows/assess-manual.yml .github/workflows/assess-scheduled.yml
 git commit -m "feat: add manual and scheduled assessment workflows"
 git push

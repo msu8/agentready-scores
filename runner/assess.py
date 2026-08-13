@@ -30,6 +30,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 REPO_ROOT = SCRIPT_DIR.parent
+STATUS_DIR = SCRIPT_DIR / "status"
 
 
 def parse_args():
@@ -74,6 +75,8 @@ def process_org(org, repos, exclusions, args, runner_lib):
     run_batch = runner_lib["run_batch"]
     commit_results = runner_lib["commit_results"]
     write_failed_repos = runner_lib["write_failed_repos"]
+    write_error_details_fn = runner_lib["write_error_details"]
+    write_new_repos_fn = runner_lib["write_new_repos"]
 
     if not repos:
         print(f"No repos listed for {org}, discovering all public repos...")
@@ -85,11 +88,11 @@ def process_org(org, repos, exclusions, args, runner_lib):
 
     if not repos:
         print(f"No repos to assess for {org}. Skipping.")
-        return 0, 0
+        return 0, 0, 0, []
 
     print(f"\nAssessing {len(repos)} repos in {org} with {args.workers} workers...")
 
-    succeeded, failed = run_batch(
+    succeeded, failed, inaccessible, results = run_batch(
         org=org,
         repos=repos,
         output_dir=args.output_dir,
@@ -100,14 +103,34 @@ def process_org(org, repos, exclusions, args, runner_lib):
     if succeeded:
         commit_results(REPO_ROOT, org, succeeded)
 
-    failed_path = SCRIPT_DIR / f"failed-{org}.yaml"
+    STATUS_DIR.mkdir(exist_ok=True)
+
+    failed_path = STATUS_DIR / f"failed-{org}.yaml"
     if failed:
         write_failed_repos(failed_path, org, failed)
         print(f"{len(failed)} repos failed. Written to {failed_path}")
     elif failed_path.exists():
         failed_path.unlink()
 
-    return len(succeeded), len(failed)
+    inaccessible_path = STATUS_DIR / f"inaccessible-{org}.yaml"
+    if inaccessible:
+        write_failed_repos(inaccessible_path, org, inaccessible)
+        print(f"{len(inaccessible)} repos inaccessible. Written to {inaccessible_path}")
+    elif inaccessible_path.exists():
+        inaccessible_path.unlink()
+
+    new_scored = [(r.repo, r.score) for r in results if r.status == "succeeded" and r.is_new]
+    new_path = STATUS_DIR / f"new-{org}.yaml"
+    if new_scored:
+        write_new_repos_fn(new_path, org, new_scored)
+        print(f"{len(new_scored)} new repo(s) scored. Written to {new_path}")
+    elif new_path.exists():
+        new_path.unlink()
+
+    errors_path = STATUS_DIR / f"errors-{org}.json"
+    write_error_details_fn(errors_path, org, results)
+
+    return len(succeeded), len(failed), len(inaccessible), results
 
 
 def main():
@@ -122,6 +145,8 @@ def main():
         run_batch,
         commit_results,
         write_failed_repos,
+        write_error_details,
+        write_new_repos,
     )
 
     runner_lib = {
@@ -130,9 +155,11 @@ def main():
         "run_batch": run_batch,
         "commit_results": commit_results,
         "write_failed_repos": write_failed_repos,
+        "write_error_details": write_error_details,
+        "write_new_repos": write_new_repos,
     }
 
-    total_succeeded = total_failed = 0
+    total_succeeded = total_failed = total_inaccessible = 0
 
     if args.from_file:
         for path_str in args.from_file:
@@ -143,9 +170,10 @@ def main():
             except SchemaError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 sys.exit(2)
-            s, f = process_org(org, repos, exclusions, args, runner_lib)
+            s, f, i, _ = process_org(org, repos, exclusions, args, runner_lib)
             total_succeeded += s
             total_failed += f
+            total_inaccessible += i
     else:
         org = args.org
         repos = []
@@ -154,11 +182,15 @@ def main():
         default_yaml = SCRIPT_DIR / "repos.yaml"
         if default_yaml.exists():
             exclusions = load_exclusions(default_yaml)
-        s, f = process_org(org, repos, exclusions, args, runner_lib)
+        s, f, i, _ = process_org(org, repos, exclusions, args, runner_lib)
         total_succeeded += s
         total_failed += f
+        total_inaccessible += i
 
-    print(f"\n=== Total: {total_succeeded} succeeded, {total_failed} failed ===")
+    parts = [f"{total_succeeded} succeeded", f"{total_failed} failed"]
+    if total_inaccessible:
+        parts.append(f"{total_inaccessible} inaccessible")
+    print(f"\n=== Total: {', '.join(parts)} ===")
     if total_failed:
         sys.exit(1)
 

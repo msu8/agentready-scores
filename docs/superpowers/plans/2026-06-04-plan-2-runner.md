@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.9+, `concurrent.futures.ThreadPoolExecutor`, `subprocess` (for podman + git), `requests` (GitHub API), `PyYAML`
 
-All work is done in: `/home/dbaez/Projects/devlake_tools/agentready-scores/`
+All work is done in: `<agentready-scores-checkout>/`
 
 ---
 
@@ -45,7 +45,7 @@ repos:
 - [ ] **Step 3: Install deps locally for development**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/agentready-scores
+cd <agentready-scores-checkout>
 pip install -r runner/requirements.txt
 ```
 
@@ -460,7 +460,7 @@ Expected: `OK`
 - [ ] **Step 5: Commit runner files**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/agentready-scores
+cd <agentready-scores-checkout>
 git add runner/assess.py runner/runner_lib.py
 git commit -m "feat: add concurrent agentready assessment runner"
 ```
@@ -474,7 +474,7 @@ Before running with podman (requires ghcr.io login), verify the CLI and discover
 - [ ] **Step 1: Test argument parsing**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/agentready-scores
+cd <agentready-scores-checkout>
 python3 runner/assess.py --help
 ```
 
@@ -526,7 +526,7 @@ podman login ghcr.io
 - [ ] **Step 2: Test a single repo assessment directly**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/agentready-scores
+cd <agentready-scores-checkout>
 python3 -c "
 from pathlib import Path
 import sys; sys.path.insert(0, 'runner')
@@ -565,7 +565,7 @@ git push
 - [ ] **Step 1: Run the full demo**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/agentready-scores
+cd <agentready-scores-checkout>
 python3 runner/assess.py --mode demo --workers 3
 ```
 

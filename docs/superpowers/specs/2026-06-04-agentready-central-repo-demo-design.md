@@ -79,7 +79,7 @@ The system has three components:
 
 **1. Copy agentready dashboards into Grafana provisioning dir:**
 ```bash
-cd /home/dbaez/Projects/devlake_tools/devlake
+cd <devlake-checkout>
 cp backend/plugins/agentready/grafana/*.json grafana/dashboards/
 ```
 

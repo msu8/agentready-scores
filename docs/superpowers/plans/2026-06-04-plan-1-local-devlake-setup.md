@@ -32,7 +32,7 @@ If Go is missing: `sudo dnf install golang`
 - [ ] **Step 1: Copy the three agentready dashboard JSONs**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/devlake
+cd <devlake-checkout>
 cp backend/plugins/agentready/grafana/fleet-overview.json grafana/dashboards/
 cp backend/plugins/agentready/grafana/findings-analysis.json grafana/dashboards/
 cp backend/plugins/agentready/grafana/repo-detail.json grafana/dashboards/
@@ -67,7 +67,7 @@ git commit -m "chore: add agentready dashboards to grafana provisioning"
 - [ ] **Step 1: Start only the infrastructure services**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/devlake
+cd <devlake-checkout>
 podman compose -f docker-compose-dev.yml up -d mysql grafana config-ui
 ```
 
@@ -104,7 +104,7 @@ PR #95 (`feat/agentready-submissions-onboarding`) already includes PR #94's Graf
 Run this in your terminal (requires network access outside the sandbox):
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/devlake
+cd <devlake-checkout>
 git remote add cryptorodeo https://github.com/CryptoRodeo/devlake.git
 ```
 
@@ -137,7 +137,7 @@ Both should exist with no "no such file" error.
 - [ ] **Step 1: Install Go dependencies**
 
 ```bash
-cd /home/dbaez/Projects/devlake_tools/devlake/backend
+cd <devlake-checkout>/backend
 make go-dep
 ```
 

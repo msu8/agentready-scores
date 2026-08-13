@@ -40,19 +40,19 @@ jobs:
 
     steps:
       - name: Checkout central repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_TOKEN }}
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -70,6 +70,11 @@ jobs:
           git config credential.helper store
           echo "https://x-access-token:${GH_TOKEN}@github.com" > ~/.git-credentials
 
+      - name: Validate GH_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python3 runner/collect_summary.py --validate-token
+
       - name: Run assessments
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -86,53 +91,28 @@ jobs:
               --retries "${{ inputs.retries }}"
           fi
 
-      - name: Collect failure summary
+      - name: Collect result summary
         if: always()
         id: summary
-        run: |
-          files=$(ls runner/failed-*.yaml 2>/dev/null || true)
-          if [ -n "$files" ]; then
-            repos=$(python3 -c "
-          import yaml, glob, sys
-          repos = []
-          for f in glob.glob('runner/failed-*.yaml'):
-              data = yaml.safe_load(open(f))
-              org = data.get('org', '?')
-              for r in (data.get('repos') or []):
-                  repos.append(f'{org}/{r}')
-          print(', '.join(repos[:20]))
-          if len(repos) > 20:
-              print(f'... and {len(repos)-20} more', file=sys.stderr)
-          ")
-            count=$(python3 -c "
-          import yaml, glob
-          print(sum(len((yaml.safe_load(open(f)).get('repos') or [])) for f in glob.glob('runner/failed-*.yaml')))
-          ")
-            echo "has_failures=true" >> $GITHUB_OUTPUT
-            echo "failed_count=$count" >> $GITHUB_OUTPUT
-            echo "failed_repos=$repos" >> $GITHUB_OUTPUT
-          else
-            echo "has_failures=false" >> $GITHUB_OUTPUT
-            echo "failed_count=0" >> $GITHUB_OUTPUT
-            echo "failed_repos=" >> $GITHUB_OUTPUT
-          fi
+        run: python3 runner/collect_summary.py
 
-      - name: Commit failed repos YAML (if any)
+      - name: Commit failed/inaccessible/new repos YAML (if any)
         if: always()
         run: |
-          files=$(ls runner/failed-*.yaml 2>/dev/null || true)
-          if [ -n "$files" ]; then
-            git add runner/failed-*.yaml
-            git commit -m "chore: record failed repos from run ${{ github.run_id }}" || true
+          git add -A -- 'runner/status/*.yaml'
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record failed/inaccessible/new repos from run ${{ github.run_id }}" || true
             git push || true
           fi
 
-      - name: Upload failed repos artifact (if any)
+      - name: Upload failed/inaccessible repos artifact (if any)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: failed-repos
-          path: runner/failed-*.yaml
+          path: |
+            runner/status/failed-*.yaml
+            runner/status/inaccessible-*.yaml
           if-no-files-found: ignore
 
   notify:
@@ -141,7 +121,7 @@ jobs:
     if: failure() && vars.SLACK_NOTIFICATIONS == 'true'
     steps:
       - name: Notify Slack on failure
-        uses: slackapi/slack-github-action@v2
+        uses: slackapi/slack-github-action@v3
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
