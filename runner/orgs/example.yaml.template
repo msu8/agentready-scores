@@ -1,9 +1,14 @@
 # Example org file — copy and rename this to <your-org>.yaml
 #
-# org:     (required) GitHub org name
-# repos:   (optional) curated list of repos to assess. If omitted, all
-#           public repos in the org are discovered automatically.
-# exclude: (optional) repos to skip regardless of discovery mode.
+# org:            (required) GitHub org name
+# repos:          (optional) curated list of repos to assess. If omitted, all
+#                  public repos in the org are discovered automatically.
+# exclude:        (optional) repos to skip regardless of discovery mode.
+# default_config: (optional) path (relative to runner/) to a shared config
+#                  file (see default-config.yaml.template) applied to any
+#                  repo in this org that has no config of its own — e.g. to
+#                  fall back to a centralized ADR repo instead of scoring
+#                  architecture_decisions as 0.
 #
 # Usage:
 #   python runner/assess.py --from-file runner/orgs/<your-org>.yaml
@@ -20,3 +25,5 @@ org: your-org-name
 #   - .fullsend
 #   - archived-repo
 #   - fork-we-dont-care-about
+
+# default_config: orgs/default-config.yaml

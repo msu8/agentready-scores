@@ -1,0 +1,14 @@
+# Example default_config file — copy, rename, and customize for your org(s).
+#
+# Referenced from an org file via the `default_config:` key (see
+# example.yaml.template). Applied to any repo in that org with no
+# .agentready/config/.agentready-config.yaml (or .agentready-config.yaml) of
+# its own, so `architecture_decisions` doesn't default to 0 just because a
+# repo doesn't host its own ADR docs — it falls back to a shared, centralized
+# ADR repo instead.
+#
+# Usage in runner/orgs/<your-org>.yaml:
+#   default_config: orgs/default-config.yaml
+adr_source:
+  repo: your-org/architecture-decisions   # repo containing the shared ADRs
+  path: ADR                               # path within that repo to the ADR docs

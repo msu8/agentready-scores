@@ -68,7 +68,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def process_org(org, repos, exclusions, args, runner_lib):
+def process_org(org, repos, exclusions, args, runner_lib, default_config=None):
     """Run assessments for one org, commit results, write failures."""
     load_exclusions = runner_lib["load_exclusions"]
     discover_org_repos = runner_lib["discover_org_repos"]
@@ -98,6 +98,7 @@ def process_org(org, repos, exclusions, args, runner_lib):
         output_dir=args.output_dir,
         workers=args.workers,
         retries=args.retries,
+        default_config=default_config,
     )
 
     if succeeded:
@@ -166,11 +167,11 @@ def main():
             path = Path(path_str)
             print(f"\n--- Processing {path} ---")
             try:
-                org, repos, exclusions = load_repos_from_file(path)
+                org, repos, exclusions, default_config = load_repos_from_file(path)
             except SchemaError as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 sys.exit(2)
-            s, f, i, _ = process_org(org, repos, exclusions, args, runner_lib)
+            s, f, i, _ = process_org(org, repos, exclusions, args, runner_lib, default_config)
             total_succeeded += s
             total_failed += f
             total_inaccessible += i

@@ -106,7 +106,28 @@ org: your-org-name
 #   - .github
 #   - .fullsend
 #   - archived-repo
+
+# default_config: configs/your-org-default-config.yaml  # optional — see below
 ```
+
+## Fallback config for missing ADRs
+
+A repo's `architecture_decisions` attribute scores 0 if it has no ADR docs of
+its own. To avoid that across a whole org, point `default_config:` at a
+shared config file (based on `runner/orgs/default-config.yaml.template`) that
+sets an `adr_source: {repo, path}` — this is applied to any repo in that org
+that doesn't have its own config (`.agentready/config/.agentready-config.yaml`
+or `.agentready-config.yaml`).
+
+1. Copy `runner/orgs/default-config.yaml.template` → e.g.
+   `runner/configs/{your-org}-default-config.yaml` and fill in the repo/path
+   that holds your shared ADRs.
+2. In `runner/orgs/{your-org}.yaml`, add:
+   ```yaml
+   default_config: configs/{your-org}-default-config.yaml
+   ```
+3. Run the assessment as normal — repos with their own config are untouched;
+   repos with none get the fallback `adr_source` injected automatically.
 
 ## Failures
 

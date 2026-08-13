@@ -1,15 +1,19 @@
 import json
 import subprocess
 import sys
+import textwrap
 import yaml
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runner"))
 
 from runner_lib import (
-    AssessmentResult, assess_repo, check_repo_access, run_batch,
+    AssessmentResult, SchemaError, assess_repo, check_repo_access, run_batch,
     write_error_details, load_error_details, write_new_repos, load_new_repos,
+    load_repos_from_file, _find_repo_config, _load_yaml_config,
 )
 
 
@@ -261,11 +265,36 @@ class TestAssessRepo:
         assert result.status == "succeeded"
         assert result.is_new is False
 
+    def test_skips_when_commit_unchanged(self, tmp_path):
+        """assess_repo returns status='skipped'/category='unchanged' when HEAD matches stored commit_hash."""
+        commit = "deadbeef" * 5
+        repo_dir = tmp_path / "myorg" / "my-repo"
+        repo_dir.mkdir(parents=True)
+        existing = repo_dir / "assessment-20260101-000000.json"
+        existing.write_text(json.dumps({"repository": {"commit_hash": commit}, "timestamp": "old"}))
+        latest = repo_dir / "assessment-latest.json"
+        latest.symlink_to(existing.name)
+
+        def mock_run(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                m = MagicMock()
+                m.returncode = 0
+                m.stdout = (commit + "\n").encode()
+                return m
+            return MagicMock(returncode=0)
+
+        with patch("runner_lib.check_repo_access", return_value="accessible"), \
+             patch("runner_lib.subprocess.run", side_effect=mock_run):
+            result = assess_repo("myorg", "my-repo", tmp_path)
+
+        assert result.status == "skipped"
+        assert result.category == "unchanged"
+
 
 class TestRunBatchInaccessible:
     def test_inaccessible_repos_separated(self, tmp_path):
         with patch("runner_lib.assess_repo") as mock_assess:
-            def side_effect(org, repo, out):
+            def side_effect(org, repo, out, default_config=None, adr_clone_dir_default=None):
                 if repo == "accessible":
                     return AssessmentResult(repo=repo, status="succeeded", category="",
                                            message="", output_path=str(tmp_path / "result.json"))
@@ -290,7 +319,7 @@ class TestRunBatchInaccessible:
     def test_inaccessible_repos_not_retried(self, tmp_path):
         call_count = {"private": 0}
 
-        def side_effect(org, repo, out):
+        def side_effect(org, repo, out, default_config=None, adr_clone_dir_default=None):
             if repo == "private":
                 call_count["private"] += 1
                 return AssessmentResult(repo=repo, status="skipped", category="auth_forbidden",
@@ -313,7 +342,7 @@ class TestRunBatchInaccessible:
     def test_failed_repos_retried(self, tmp_path):
         call_count = {"flaky": 0}
 
-        def side_effect(org, repo, out):
+        def side_effect(org, repo, out, default_config=None, adr_clone_dir_default=None):
             call_count["flaky"] += 1
             if call_count["flaky"] == 1:
                 return AssessmentResult(repo=repo, status="failed", category="clone_failure",
@@ -338,7 +367,7 @@ class TestRunBatchInaccessible:
         """When a repo fails then succeeds on retry, only the success result should appear in all_results."""
         call_count = {"flaky": 0}
 
-        def side_effect(org, repo, out):
+        def side_effect(org, repo, out, default_config=None, adr_clone_dir_default=None):
             call_count["flaky"] += 1
             if call_count["flaky"] == 1:
                 return AssessmentResult(repo=repo, status="failed", category="clone_failure",
@@ -469,3 +498,277 @@ class TestLoadNewRepos:
 
     def test_no_files_returns_empty(self, tmp_path):
         assert load_new_repos(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# default_config (config.md Section 2) — org-level ADR fallback config
+# ---------------------------------------------------------------------------
+
+class TestDefaultConfig:
+    def test_loads_fallback_config_referenced_by_default_config(self, tmp_path):
+        adr_config = tmp_path / "default-config.yaml"
+        adr_config.write_text(textwrap.dedent("""\
+            adr_source:
+              repo: konflux-ci/architecture
+              path: ADR
+        """))
+        f = tmp_path / "repos.yaml"
+        f.write_text(textwrap.dedent(f"""\
+            org: my-org
+            repos:
+              - repo-a
+            default_config: {adr_config}
+        """))
+        # default_config is resolved relative to RUNNER_DIR in production, but
+        # accepts an absolute path here too since Path(RUNNER_DIR / abs_path)
+        # collapses to abs_path.
+        org, repos, exclusions, default_config = load_repos_from_file(f)
+        assert default_config == {
+            "adr_source": {"repo": "konflux-ci/architecture", "path": "ADR"}
+        }
+
+    def test_absent_default_config_returns_none(self, tmp_path):
+        f = tmp_path / "repos.yaml"
+        f.write_text("org: my-org\nrepos:\n  - repo-a\n")
+        org, repos, exclusions, default_config = load_repos_from_file(f)
+        assert default_config is None
+
+    def test_missing_default_config_file_raises_schema_error(self, tmp_path):
+        f = tmp_path / "repos.yaml"
+        f.write_text(textwrap.dedent("""\
+            org: my-org
+            default_config: does/not/exist.yaml
+        """))
+        # Must fail on the file-not-found check, not be rejected as an unknown key.
+        with pytest.raises(SchemaError, match="file not found"):
+            load_repos_from_file(f)
+
+    def test_default_config_non_string_raises_schema_error(self, tmp_path):
+        f = tmp_path / "repos.yaml"
+        f.write_text("org: my-org\ndefault_config: 123\n")
+        with pytest.raises(SchemaError, match="'default_config' must be a string"):
+            load_repos_from_file(f)
+
+
+# ---------------------------------------------------------------------------
+# _find_repo_config / _load_yaml_config (config.md Section 1)
+# ---------------------------------------------------------------------------
+
+class TestFindRepoConfig:
+    def test_subdirectory_config_found(self, tmp_path):
+        cfg_dir = tmp_path / ".agentready" / "config"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / ".agentready-config.yaml").write_text("adr_source:\n  repo: x\n")
+        assert _find_repo_config(tmp_path) == cfg_dir / ".agentready-config.yaml"
+
+    def test_root_config_found_when_no_subdirectory(self, tmp_path):
+        (tmp_path / ".agentready-config.yaml").write_text("adr_source:\n  repo: x\n")
+        assert _find_repo_config(tmp_path) == tmp_path / ".agentready-config.yaml"
+
+    def test_subdirectory_wins_over_root(self, tmp_path):
+        cfg_dir = tmp_path / ".agentready" / "config"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / ".agentready-config.yaml").write_text("a: 1\n")
+        (tmp_path / ".agentready-config.yaml").write_text("b: 2\n")
+        assert _find_repo_config(tmp_path) == cfg_dir / ".agentready-config.yaml"
+
+    def test_no_config_returns_none(self, tmp_path):
+        assert _find_repo_config(tmp_path) is None
+
+
+class TestLoadYamlConfig:
+    def test_loads_valid_yaml(self, tmp_path):
+        f = tmp_path / "config.yaml"
+        f.write_text("adr_source:\n  repo: konflux-ci/architecture\n  path: ADR\n")
+        assert _load_yaml_config(f) == {"adr_source": {"repo": "konflux-ci/architecture", "path": "ADR"}}
+
+    def test_invalid_yaml_returns_none(self, tmp_path):
+        f = tmp_path / "config.yaml"
+        f.write_text("not: valid: yaml: [\n")
+        assert _load_yaml_config(f) is None
+
+    def test_non_mapping_yaml_returns_none(self, tmp_path):
+        f = tmp_path / "config.yaml"
+        f.write_text("- just\n- a\n- list\n")
+        assert _load_yaml_config(f) is None
+
+    def test_empty_file_returns_empty_dict(self, tmp_path):
+        f = tmp_path / "config.yaml"
+        f.write_text("")
+        assert _load_yaml_config(f) == {}
+
+
+# ---------------------------------------------------------------------------
+# run_batch — adr_source batch-level clone (config.md Section 3)
+# ---------------------------------------------------------------------------
+
+class TestRunBatchAdrSource:
+    def test_adr_source_present_clones_once_and_passes_to_workers(self, tmp_path):
+        default_config = {"adr_source": {"repo": "konflux-ci/architecture", "path": "ADR"}}
+        calls = []
+
+        def fake_assess(org, repo, output_dir, default_config=None, adr_clone_dir_default=None):
+            calls.append((repo, default_config, adr_clone_dir_default))
+            return AssessmentResult(repo=repo, status="succeeded", category="", message="", output_path="ok")
+
+        clone_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "clone" in cmd:
+                clone_calls.append(cmd)
+                Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0)
+
+        with patch("runner_lib.assess_repo", side_effect=fake_assess), \
+             patch("runner_lib.subprocess.run", side_effect=fake_run):
+            succeeded, failed, inaccessible, results = run_batch(
+                org="konflux-ci", repos=["repo-a", "repo-b"], output_dir=tmp_path,
+                workers=2, retries=0, default_config=default_config,
+            )
+
+        assert sorted(succeeded) == ["repo-a", "repo-b"]
+        assert failed == []
+        assert inaccessible == []
+        # Exactly one clone of the ADR repo for the whole batch, not per-repo.
+        adr_clones = [c for c in clone_calls if "architecture" in c[-2]]
+        assert len(adr_clones) == 1
+        # Every worker got the same non-None adr_clone_dir_default.
+        dirs_seen = {c[2] for c in calls}
+        assert len(dirs_seen) == 1
+        assert list(dirs_seen)[0] is not None
+
+    def test_no_adr_source_skips_clone(self, tmp_path):
+        ok_result = AssessmentResult(repo="repo-a", status="succeeded", category="", message="", output_path="ok")
+        with patch("runner_lib.assess_repo", return_value=ok_result) as mock_assess, \
+             patch("runner_lib.subprocess.run") as mock_run:
+            run_batch(org="my-org", repos=["repo-a"], output_dir=tmp_path, workers=1, retries=0)
+
+        mock_run.assert_not_called()
+        assert mock_assess.call_args[0][4] is None  # adr_clone_dir_default positional arg
+
+    def test_adr_clone_failure_continues_without_adr_source(self, tmp_path):
+        default_config = {"adr_source": {"repo": "bad/repo", "path": "ADR"}}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "clone" in cmd:
+                raise subprocess.CalledProcessError(1, cmd)
+            return MagicMock(returncode=0)
+
+        ok_result = AssessmentResult(repo="repo-a", status="succeeded", category="", message="", output_path="ok")
+        with patch("runner_lib.assess_repo", return_value=ok_result) as mock_assess, \
+             patch("runner_lib.subprocess.run", side_effect=fake_run):
+            succeeded, failed, inaccessible, results = run_batch(
+                org="my-org", repos=["repo-a"], output_dir=tmp_path,
+                workers=1, retries=0, default_config=default_config,
+            )
+
+        assert succeeded == ["repo-a"]
+        assert mock_assess.call_args[0][4] is None  # clone failed — no adr_clone_dir_default
+
+
+# ---------------------------------------------------------------------------
+# assess_repo — config discovery + adr_source resolution (config.md Sections 1-4)
+# ---------------------------------------------------------------------------
+
+class TestAssessRepoConfigResolution:
+    COMMIT = "deadbeef" * 5
+
+    def _fake_run(self, podman_cmds, capture_config_into=None):
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "clone" in cmd:
+                Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+                return MagicMock(returncode=0)
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                m = MagicMock()
+                m.returncode = 0
+                m.stdout = (self.COMMIT + "\n").encode()
+                return m
+            if cmd[0] == "podman":
+                podman_cmds.append(cmd)
+                if capture_config_into is not None:
+                    for part in cmd:
+                        if part.endswith(":/agentready-config.yaml:ro,z"):
+                            host_path = Path(part.split(":")[0])
+                            capture_config_into["contents"] = host_path.read_text()
+                return MagicMock(returncode=0)
+            return MagicMock(returncode=0)
+        return fake_run
+
+    def test_own_config_with_no_adr_source_is_mounted_as_is(self, tmp_path):
+        podman_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "git" and "clone" in cmd:
+                clone_dir = Path(cmd[-1])
+                clone_dir.mkdir(parents=True, exist_ok=True)
+                (clone_dir / ".agentready-config.yaml").write_text("exclude:\n  - foo\n")
+                return MagicMock(returncode=0)
+            if cmd[0] == "git" and "rev-parse" in cmd:
+                m = MagicMock()
+                m.returncode = 0
+                m.stdout = (self.COMMIT + "\n").encode()
+                return m
+            if cmd[0] == "podman":
+                podman_cmds.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch("runner_lib.check_repo_access", return_value="accessible"), \
+             patch("runner_lib.subprocess.run", side_effect=fake_run), \
+             patch("runner_lib.subprocess.check_output", return_value=b"1000\n"), \
+             patch("runner_lib.glob.glob", return_value=["/fake/assessment-20260101-000000.json"]), \
+             patch("runner_lib.os.path.islink", return_value=False), \
+             patch("runner_lib.shutil.copy2"), \
+             patch("runner_lib.Path.symlink_to"), \
+             patch("runner_lib.Path.resolve", lambda self: self):
+            result = assess_repo("konflux-ci", "some-repo", tmp_path)
+
+        assert result.status == "succeeded"
+        assert podman_cmds, "podman run should have been invoked"
+        cmd = podman_cmds[0]
+        assert "--config" in cmd
+        assert cmd[cmd.index("--config") + 1] == "/agentready-config.yaml"
+        assert any(":/agentready-config.yaml:ro,z" in part for part in cmd)
+
+    def test_fallback_adr_source_used_when_no_own_config(self, tmp_path):
+        default_config = {"adr_source": {"repo": "konflux-ci/architecture", "path": "ADR"}}
+        adr_clone_dir = tmp_path / "adr-clone"
+        adr_clone_dir.mkdir()
+        podman_cmds = []
+        captured = {}
+
+        with patch("runner_lib.check_repo_access", return_value="accessible"), \
+             patch("runner_lib.subprocess.run", side_effect=self._fake_run(podman_cmds, captured)), \
+             patch("runner_lib.subprocess.check_output", return_value=b"1000\n"), \
+             patch("runner_lib.glob.glob", return_value=["/fake/assessment-20260101-000000.json"]), \
+             patch("runner_lib.os.path.islink", return_value=False), \
+             patch("runner_lib.shutil.copy2"), \
+             patch("runner_lib.Path.symlink_to"), \
+             patch("runner_lib.Path.resolve", lambda self: self):
+            result = assess_repo("konflux-ci", "some-repo", tmp_path, default_config, adr_clone_dir)
+
+        assert result.status == "succeeded"
+        assert podman_cmds, "podman run should have been invoked"
+        cmd = podman_cmds[0]
+        assert "--config" in cmd
+        assert any(part == f"{adr_clone_dir}:/adr-repo:ro,z" for part in cmd)
+        # Patched config content (captured pre-cleanup) should point adr_source.repo
+        # at the container path, not the original GitHub org/repo shorthand.
+        patched = yaml.safe_load(captured["contents"])
+        assert patched["adr_source"]["repo"] == "/adr-repo"
+
+    def test_no_own_config_and_no_default_config_passes_no_flag(self, tmp_path):
+        podman_cmds = []
+
+        with patch("runner_lib.check_repo_access", return_value="accessible"), \
+             patch("runner_lib.subprocess.run", side_effect=self._fake_run(podman_cmds)), \
+             patch("runner_lib.subprocess.check_output", return_value=b"1000\n"), \
+             patch("runner_lib.glob.glob", return_value=["/fake/assessment-20260101-000000.json"]), \
+             patch("runner_lib.os.path.islink", return_value=False), \
+             patch("runner_lib.shutil.copy2"), \
+             patch("runner_lib.Path.symlink_to"), \
+             patch("runner_lib.Path.resolve", lambda self: self):
+            result = assess_repo("konflux-ci", "some-repo", tmp_path)
+
+        assert result.status == "succeeded"
+        assert podman_cmds, "podman run should have been invoked"
+        assert "--config" not in podman_cmds[0]
